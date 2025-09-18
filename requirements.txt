@@ -1,0 +1,4 @@
+# requirements.txt for Lambda
+requests==2.31.0
+beautifulsoup4==4.12.2
+boto3==1.28.62
