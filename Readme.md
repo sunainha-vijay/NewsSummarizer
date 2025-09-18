@@ -3,7 +3,7 @@
 Challenge 2: AI News Summarizer
 -------------------------------
 
-Demo Link: http://challenge2sunainha.s3-website.ap-south-1.amazonaws.com/
+Endpoint: http://challenge2sunainha.s3-website.ap-south-1.amazonaws.com/
 
 *   A serverless application to summarize news articles using an **AI API** and **DynamoDB** for caching.The project consists of:
     
