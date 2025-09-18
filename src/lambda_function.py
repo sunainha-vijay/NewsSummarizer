@@ -1,3 +1,12 @@
+"""
+AWS Lambda function to scrape, summarize, and cache news articles.
+
+This function acts as a serverless backend for a news summarizer application.
+It exposes a single POST endpoint that accepts a URL, scrapes the article content,
+generates a summary using a third-party API, and caches the result in DynamoDB
+to reduce latency and redundant processing for subsequent requests.
+"""
+
 import json
 import boto3
 import requests
@@ -7,108 +16,129 @@ import re
 from bs4 import BeautifulSoup
 import logging
 
-# Configure logging
+# --- GLOBAL INITIALIZATION ---
+
+# Configure logging for CloudWatch
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Initialize DynamoDB client
+# Initialize the DynamoDB client. Boto3 will use the Lambda's IAM role for credentials.
 dynamodb = boto3.resource('dynamodb')
-cache_table = dynamodb.Table('news-summarizer-cache')
+cache_table = dynamodb.Table('news-summarizer-cache') # Replace with your table name if different
 
 def lambda_handler(event, context):
     """
-    AWS Lambda handler for news summarization
+    Main AWS Lambda handler function.
+
+    This function orchestrates the entire process:
+    1. Handles CORS and validates the incoming request.
+    2. Checks a DynamoDB table for a cached summary.
+    3. If not cached, scrapes the article content from the URL.
+    4. Calls an external API to summarize the text.
+    5. Caches the new result in DynamoDB.
+    6. Returns a formatted JSON response.
+
+    Args:
+        event (dict): The event dictionary containing request details (e.g., body, headers).
+        context (object): The context object providing runtime information.
+
+    Returns:
+        dict: A formatted API Gateway response dictionary.
     """
     try:
-        # ✅ Handle CORS preflight
+        # --- 1. CORS Preflight and Request Validation ---
+
+        # Handle CORS preflight requests sent by browsers to check permissions.
         if event.get("httpMethod") == "OPTIONS":
             return {
                 "statusCode": 200,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "Content-Type"
-                },
+                "headers": cors_headers(),
                 "body": json.dumps({"message": "CORS preflight success"})
             }
 
-        # Parse request body
+        # Parse the request body, handling both API Gateway proxy events and direct invocations.
         if event.get('httpMethod') == 'POST':
             body = json.loads(event['body'])
         else:
             body = event
 
+        # Ensure a URL was provided in the request body.
         url = body.get('url')
         if not url:
-            return {
-                'statusCode': 400,
-                'headers': cors_headers(),
-                'body': json.dumps({
-                    'error': 'URL is required',
-                    'message': 'Please provide a valid news article URL'
-                })
-            }
+            return error_response('URL is required', 400)
 
-        # Validate URL
+        # Validate the format of the provided URL.
         if not is_valid_url(url):
             return error_response('Invalid URL format', 400)
 
-        # Generate cache key
+        # --- 2. Caching Logic ---
+
+        # Generate a unique and consistent cache key from the URL using an MD5 hash.
         cache_key = generate_cache_key(url)
 
-        # Check cache first
+        # Check DynamoDB for a fresh, valid summary.
         cached_summary = get_cached_summary(cache_key)
         if cached_summary:
             logger.info(f"Returning cached summary for URL: {url}")
             return success_response(cached_summary, from_cache=True)
 
-        # Fetch article content
-        article_text = extract_article_content(url)
+        # --- 3. Core Processing (if not cached) ---
+
+        # Scrape the main textual content from the news article's webpage.
+        logger.info(f"Fetching fresh content for URL: {url}")
+        article_text, article_title = extract_article_content_and_title(url)
         if not article_text:
             return error_response('Failed to extract article content', 400)
 
-        # Summarize using free API
+        # Send the extracted text to a summarization API.
         summary = summarize_text(article_text)
         if not summary:
             return error_response('Failed to generate summary', 500)
 
-        # Prepare response data
+        # --- 4. Response Preparation and Caching ---
+
+        # Prepare the final data structure for the response body.
+        original_word_count = len(article_text.split())
+        summary_word_count = len(summary.split())
+        
         result = {
             'url': url,
-            'title': extract_title_from_url(url),
+            'title': article_title,
             'summary': summary,
-            'word_count': len(summary.split()),
-            'original_length': len(article_text.split()),
-            'compression_ratio': round(len(summary.split()) / len(article_text.split()), 2),
-            'summarized_at': datetime.now().isoformat(),
-            'cache_key': cache_key
+            'word_count': summary_word_count,
+            'original_length': original_word_count,
+            # Calculate the compression ratio, handling potential division by zero.
+            'compression_ratio': round(original_word_count / summary_word_count, 2) if summary_word_count > 0 else 0,
+            'summarized_at': datetime.now().isoformat()
         }
 
-        # Cache the result
+        # Store the newly generated summary in DynamoDB for future requests.
         cache_summary(cache_key, result)
 
-        logger.info(f"Successfully summarized article from: {url}")
+        logger.info(f"Successfully summarized and cached article from: {url}")
         return success_response(result)
 
     except Exception as e:
+        # Catch-all for any unexpected errors during execution.
         logger.error(f"Error in lambda_handler: {str(e)}")
         return error_response(f'Internal server error: {str(e)}', 500)
 
+# --- Helper Functions ---
+
 def cors_headers():
-    """Reusable CORS headers"""
+    """Provides a reusable dictionary of CORS headers for API Gateway responses."""
     return {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': '*', # Allow requests from any origin
         'Access-Control-Allow-Methods': 'POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type'
     }
 
 def is_valid_url(url):
-    """Validate URL format"""
+    """Validates the URL format using a regular expression."""
     url_pattern = re.compile(
         r'^https?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
+        r'(?:(?:[A-Z09](?:[A-Z09-]{0,61}[A-Z09])?\.)+[A-Z]{2,6}\.?|'  # domain...
         r'localhost|'  # localhost...
         r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
         r'(?::\d+)?'  # optional port
@@ -116,207 +146,216 @@ def is_valid_url(url):
     return url_pattern.match(url) is not None
 
 def generate_cache_key(url):
-    """Generate cache key from URL"""
+    """Generates a consistent MD5 hash of a URL to use as a DynamoDB primary key."""
     return hashlib.md5(url.encode()).hexdigest()
 
 def get_cached_summary(cache_key):
-    """Retrieve cached summary from DynamoDB"""
+    """
+    Retrieves a cached summary from DynamoDB if it exists and is less than 24 hours old.
+    
+    Args:
+        cache_key (str): The MD5 hash of the URL.
+        
+    Returns:
+        dict or None: The cached summary data, or None if not found or expired.
+    """
     try:
         response = cache_table.get_item(Key={'cache_key': cache_key})
 
         if 'Item' in response:
             item = response['Item']
-            # Check if cache is still valid (24 hours)
+            # Check if the cached item is still valid (e.g., within 24 hours).
             cached_time = datetime.fromisoformat(item['cached_at'])
             if datetime.now() - cached_time < timedelta(hours=24):
                 return item['summary_data']
+            else:
+                logger.info(f"Cache expired for key: {cache_key}")
 
         return None
-
     except Exception as e:
         logger.warning(f"Error retrieving from cache: {str(e)}")
         return None
 
 def cache_summary(cache_key, summary_data):
-    """Cache summary in DynamoDB"""
+    """
+    Stores a summary result in DynamoDB with a Time-To-Live (TTL) attribute.
+    
+    Args:
+        cache_key (str): The MD5 hash of the URL.
+        summary_data (dict): The summary data to cache.
+    """
     try:
+        # DynamoDB's TTL feature automatically deletes items after the specified timestamp.
+        ttl_timestamp = int((datetime.now() + timedelta(days=7)).timestamp())
+        
         cache_table.put_item(
             Item={
                 'cache_key': cache_key,
                 'summary_data': summary_data,
                 'cached_at': datetime.now().isoformat(),
-                'ttl': int((datetime.now() + timedelta(days=7)).timestamp())  # Auto-delete after 7 days
+                'ttl': ttl_timestamp  # Auto-delete after 7 days
             }
         )
     except Exception as e:
         logger.warning(f"Error caching summary: {str(e)}")
 
-def extract_article_content(url):
-    """Extract text content from news article"""
+def extract_article_content_and_title(url):
+    """
+    Extracts the main text content and title from a news article's HTML.
+    
+    Args:
+        url (str): The URL of the news article.
+        
+    Returns:
+        tuple: A tuple containing the article text (str) and title (str), or (None, None) on failure.
+    """
     try:
+        # Use a common User-Agent to mimic a browser and avoid being blocked.
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Remove script and style elements
-        for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            script.decompose()
+        # --- Title Extraction ---
+        title_tag = soup.find('title')
+        title = title_tag.get_text().strip() if title_tag else "Article"
 
-        # Try to find main content areas
-        content_selectors = [
-            'article',
-            '.article-content',
-            '.post-content',
-            '.entry-content',
-            '.content',
-            'main',
-            '#content'
-        ]
+        # --- Content Extraction ---
+        # Remove common non-content tags to reduce noise.
+        for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            element.decompose()
 
-        article_text = ""
+        # Try to find the main content by looking for common semantic tags and class names.
+        content_selectors = ['article', '.article-body', '.story-content', 'main', '#content']
+        text_parts = []
         for selector in content_selectors:
             elements = soup.select(selector)
             if elements:
                 for element in elements:
-                    article_text += element.get_text(strip=True) + " "
-                break
+                    text_parts.append(element.get_text(separator=' ', strip=True))
+                break # Stop after the first successful selector.
 
-        # Fallback: get all paragraph text
-        if not article_text.strip():
+        # Fallback: If no specific content area is found, get all paragraph text.
+        if not text_parts:
             paragraphs = soup.find_all('p')
-            article_text = ' '.join([p.get_text(strip=True) for p in paragraphs])
+            text_parts = [p.get_text(strip=True) for p in paragraphs]
 
-        # Clean up text
+        article_text = ' '.join(text_parts)
+        # Clean up extra whitespace.
         article_text = re.sub(r'\s+', ' ', article_text).strip()
 
-        # Minimum content check
-        if len(article_text) < 100:
-            raise ValueError("Article content too short")
+        # Ensure the content is substantial enough to be summarized.
+        if len(article_text.split()) < 50:
+            return None, None
 
-        return article_text[:5000]  # Limit to 5000 chars for API limits
+        # Truncate the text to stay within the limits of the summarization API.
+        return article_text[:5000], title
 
     except Exception as e:
         logger.error(f"Error extracting article content: {str(e)}")
-        return None
-
-def extract_title_from_url(url):
-    """Extract title from webpage"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=5)
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        title = soup.find('title')
-        if title:
-            return title.get_text().strip()
-
-        # Fallback: try h1
-        h1 = soup.find('h1')
-        if h1:
-            return h1.get_text().strip()
-
-        return "Article"
-
-    except:
-        return "Article"
+        return None, None
 
 def summarize_text(text):
-    """Summarize text using free NLP API"""
+    """
+    Summarizes the provided text using the Hugging Face Inference API.
+    Includes a simple fallback summarizer if the API call fails.
+    
+    Args:
+        text (str): The text to be summarized.
+        
+    Returns:
+        str: The summarized text.
+    """
     try:
-        # Using Hugging Face's free inference API
+        # !!! SECURITY WARNING !!!
+        # Hardcoding API keys is a major security risk.
+        # This token should be stored in AWS Secrets Manager or as an encrypted Lambda environment variable.
+        api_key = os.environ.get("HUGGING_FACE_API_KEY", "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") # Example fallback
+        
         api_url = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-
         headers = {
-            "Authorization": "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",  # Replace with actual token
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-
         payload = {
             "inputs": text,
-            "parameters": {
-                "max_length": 150,
-                "min_length": 50,
-                "do_sample": False
-            }
+            "parameters": {"max_length": 150, "min_length": 40, "do_sample": False}
         }
-
+        
         response = requests.post(api_url, headers=headers, json=payload, timeout=30)
 
         if response.status_code == 200:
             result = response.json()
+            # The API can return a list or a dictionary, so we handle both cases.
             if isinstance(result, list) and len(result) > 0:
                 return result[0].get('summary_text', '')
-            elif isinstance(result, dict):
-                return result.get('summary_text', '')
-
-        # Fallback: Simple extractive summarization
+        
+        # If the API call fails, log the issue and use the simple fallback.
+        logger.warning(f"Hugging Face API failed with status {response.status_code}. Using fallback summarizer.")
         return simple_extractive_summary(text)
 
     except Exception as e:
-        logger.error(f"Error in summarization: {str(e)}")
+        logger.error(f"Error in summarization API call: {str(e)}")
+        # If any exception occurs (e.g., timeout), use the simple fallback.
         return simple_extractive_summary(text)
 
-def simple_extractive_summary(text, max_sentences=3):
-    """Simple extractive summarization fallback"""
-    sentences = re.split(r'[.!?]+', text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+def simple_extractive_summary(text, num_sentences=3):
+    """A very basic fallback summarizer that picks the most important sentences."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    # Filter out very short or non-sensical "sentences".
+    sentences = [s.strip() for s in sentences if len(s.split()) > 5]
 
-    if len(sentences) <= max_sentences:
-        return '. '.join(sentences) + '.'
+    if len(sentences) <= num_sentences:
+        return ' '.join(sentences)
 
-    # Score sentences by length and position
+    # A simple scoring mechanism: prefer longer sentences that appear earlier in the article.
     scored_sentences = []
     for i, sentence in enumerate(sentences):
-        score = len(sentence.split()) * (1 - i / len(sentences))  # Prefer longer, earlier sentences
+        score = len(sentence.split()) * (1 - (i / len(sentences)))
         scored_sentences.append((score, sentence))
 
-    # Select top sentences
-    scored_sentences.sort(reverse=True)
-    top_sentences = [s[1] for s in scored_sentences[:max_sentences]]
-
-    return '. '.join(top_sentences) + '.'
+    # Get the top N scored sentences and sort them by their original appearance.
+    top_sentences = sorted(scored_sentences, key=lambda x: x[0], reverse=True)[:num_sentences]
+    top_sentences.sort(key=lambda x: sentences.index(x[1])) # Re-sort by original order
+    
+    return ' '.join([s[1] for s in top_sentences])
 
 def success_response(data, from_cache=False):
-    """Generate success response"""
+    """Generates a consistent, successful API Gateway response."""
     return {
         'statusCode': 200,
         'headers': cors_headers(),
         'body': json.dumps({
             'success': True,
             'data': data,
-            'from_cache': from_cache,
-            'timestamp': datetime.now().isoformat()
+            'from_cache': from_cache
         })
     }
 
 def error_response(message, status_code=500):
-    """Generate error response"""
+    """Generates a consistent, failed API Gateway response."""
     return {
         'statusCode': status_code,
         'headers': cors_headers(),
         'body': json.dumps({
             'success': False,
-            'error': message,
-            'timestamp': datetime.now().isoformat()
+            'error': message
         })
     }
 
-# For local testing
+# This block is for local testing only and will not be executed in the AWS Lambda environment.
 if __name__ == "__main__":
-    # Test event
+    # Simulate an API Gateway POST event.
     test_event = {
         'httpMethod': 'POST',
         'body': json.dumps({
-            'url': 'https://www.example.com/news-article'
+            'url': 'https://www.bbc.com/news/technology-58289753' # Example URL
         })
     }
-
+    # Call the handler function directly.
     result = lambda_handler(test_event, None)
-    print(json.dumps(result, indent=2))
+    # Pretty-print the JSON result.
+    print(json.dumps(json.loads(result['body']), indent=2))
