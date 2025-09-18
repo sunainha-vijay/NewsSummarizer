@@ -303,10 +303,12 @@
     </div>
 
     <script>
-        // Configuration
+        // --- CONFIGURATION ---
+        // The backend endpoint for the AWS Lambda function that performs the summarization.
         const API_ENDPOINT = 'https://yz9brshcd6.execute-api.ap-south-1.amazonaws.com/dev/summarize';
         
-        // DOM elements
+        // --- DOM ELEMENT SELECTION ---
+        // Get references to all the necessary HTML elements to manipulate them later.
         const urlInput = document.getElementById('urlInput');
         const summarizeBtn = document.getElementById('summarizeBtn');
         const loading = document.getElementById('loading');
@@ -318,24 +320,32 @@
         const originalLength = document.getElementById('originalLength');
         const compressionRatio = document.getElementById('compressionRatio');
 
-        // Event listeners
+        // --- EVENT LISTENERS ---
+        // Trigger the summary process when the main button is clicked.
         summarizeBtn.addEventListener('click', summarizeArticle);
+        
+        // Allow submitting by pressing the 'Enter' key in the input field for convenience.
         urlInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') summarizeArticle();
         });
 
-        // Example URL handlers
+        // Set up the example URL links to populate the input field when clicked.
         document.querySelectorAll('.example-url').forEach(link => {
             link.addEventListener('click', (e) => {
-                e.preventDefault();
+                e.preventDefault(); // Prevent the link from navigating.
                 urlInput.value = e.target.dataset.url;
-                urlInput.focus();
+                urlInput.focus(); // Focus the input field for a better user experience.
             });
         });
 
+        /**
+         * Main function to validate the URL, send it to the backend API,
+         * and display the resulting summary or an error message.
+         */
         async function summarizeArticle() {
             const url = urlInput.value.trim();
             
+            // 1. Validate the URL input before making an API call.
             if (!url) {
                 showError('Please enter a valid URL');
                 return;
@@ -346,11 +356,12 @@
                 return;
             }
 
-            // Reset UI
+            // 2. Reset the UI to a loading state.
             hideResults();
             showLoading();
 
             try {
+                // 3. Make the API call to the backend Lambda function.
                 const response = await fetch(API_ENDPOINT, {
                     method: 'POST',
                     headers: {
@@ -361,10 +372,12 @@
 
                 const data = await response.json();
 
+                // Handle HTTP-level errors (e.g., 500, 404).
                 if (!response.ok) {
                     throw new Error(data.error || 'Failed to summarize article');
                 }
 
+                // Handle application-level success or error from the Lambda's response.
                 if (data.success) {
                     showResults(data.data, data.from_cache);
                 } else {
@@ -372,27 +385,41 @@
                 }
 
             } catch (err) {
+                // Handle network errors or exceptions thrown during the process.
                 console.error('Summarization error:', err);
                 showError(err.message || 'Failed to summarize article. Please try again.');
             } finally {
+                // 4. Clean up the UI, regardless of success or failure.
                 hideLoading();
             }
         }
 
+        /**
+         * Displays the loading spinner and disables the button to prevent multiple submissions.
+         */
         function showLoading() {
             loading.style.display = 'block';
             summarizeBtn.disabled = true;
             summarizeBtn.textContent = 'Processing...';
         }
 
+        /**
+         * Hides the loading spinner and re-enables the button.
+         */
         function hideLoading() {
             loading.style.display = 'none';
             summarizeBtn.disabled = false;
             summarizeBtn.textContent = 'Summarize Article';
         }
 
+        /**
+         * Populates the result card with the summarized content and statistics.
+         * @param {object} data - The data object from the API response.
+         * @param {boolean} fromCache - Indicates if the result was served from the cache.
+         */
         function showResults(data, fromCache = false) {
             articleTitle.textContent = data.title || 'Article';
+            // Add a small badge if the result was cached.
             if (fromCache) {
                 articleTitle.innerHTML += '<span class="cache-badge">Cached</span>';
             }
@@ -403,20 +430,32 @@
             compressionRatio.textContent = (data.compression_ratio || 0) + 'x';
             
             result.style.display = 'block';
-            error.style.display = 'none';
+            error.style.display = 'none'; // Ensure any previous error is hidden.
         }
 
+        /**
+         * Displays an error message to the user.
+         * @param {string} message - The error message to display.
+         */
         function showError(message) {
             error.textContent = message;
             error.style.display = 'block';
-            result.style.display = 'none';
+            result.style.display = 'none'; // Ensure any previous result is hidden.
         }
 
+        /**
+         * Hides both the result and error panels, resetting the UI.
+         */
         function hideResults() {
             result.style.display = 'none';
             error.style.display = 'none';
         }
 
+        /**
+         * A simple utility to validate if a string is a valid HTTP/HTTPS URL.
+         * @param {string} string - The URL string to validate.
+         * @returns {boolean} - True if the URL is valid, false otherwise.
+         */
         function isValidUrl(string) {
             try {
                 const url = new URL(string);
@@ -426,7 +465,7 @@
             }
         }
 
-        // Auto-focus URL input
+        // Automatically focus the input field on page load for a better user experience.
         urlInput.focus();
     </script>
 </body>
